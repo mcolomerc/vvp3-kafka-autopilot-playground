@@ -26,3 +26,5 @@ results.csv
 **/*.env
 **/secrets.yaml
 **/credentials.json
+.claude/
+CLAUDE.md
