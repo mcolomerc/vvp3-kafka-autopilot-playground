@@ -1,0 +1,281 @@
+---
+# StatefulSet for a 3-node Apache Kafka 3.7 cluster in KRaft combined mode.
+#
+# Key design decisions:
+#   - Combined broker+controller mode: each pod is both a data broker and a
+#     Raft voter. This is suitable for a 3-node cluster and avoids the
+#     operational cost of dedicated controller pods.
+#   - Init container renders node.id and advertised.listeners, then formats
+#     the KRaft storage directory exactly once (--ignore-formatted is safe to
+#     call on an already-formatted directory).
+#   - /tmp is an emptyDir so the rendered server.properties survives across
+#     init → main container handoff within the same pod lifecycle.
+#   - PVC per pod (volumeClaimTemplates) ensures Kafka data survives pod
+#     restarts and rescheduling without data loss.
+#   - podAntiAffinity spreads brokers across different nodes to avoid a single
+#     node failure taking down the majority of the quorum.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: kafka
+  labels:
+    app: kafka
+    component: broker
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: broker
+    app.kubernetes.io/part-of: vvp3-autopilot-showcase
+    app.kubernetes.io/version: "3.7.0"
+spec:
+  serviceName: kafka-headless    # Must match the headless Service name in 03-services.yaml
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka
+      component: broker
+  # Parallel pod management allows all brokers to start simultaneously.
+  # OrderedReady (default) would serialize startup, which is unnecessary for
+  # KRaft because the cluster can form once a majority of voters are up.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable=1 ensures at least 2 out of 3 brokers remain available
+      # during a rolling update, preserving the controller quorum.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: kafka
+        component: broker
+        app.kubernetes.io/name: kafka
+        app.kubernetes.io/component: broker
+        app.kubernetes.io/part-of: vvp3-autopilot-showcase
+    spec:
+      # Terminate gracefully: give in-flight produce/consume requests time to
+      # drain before SIGKILL. Kafka's default shutdown timeout is 30 s.
+      terminationGracePeriodSeconds: 60
+      # apache/kafka:3.7.0 runs as appuser (UID 1000, GID 1000).
+      # fsGroup ensures the PVC data directory is group-owned by 1000 so
+      # the non-root appuser can write to it.
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+
+      # -----------------------------------------------------------------------
+      # Pod anti-affinity: prefer scheduling each broker on a different node.
+      # Using "preferred" (soft) rather than "required" (hard) so that the
+      # cluster can still be scheduled on a single-node dev environment.
+      # Change to requiredDuringSchedulingIgnoredDuringExecution for production
+      # environments with guaranteed node count >= 3.
+      # -----------------------------------------------------------------------
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: kafka
+                    component: broker
+                topologyKey: kubernetes.io/hostname
+
+      # -----------------------------------------------------------------------
+      # Init container: render config and format KRaft storage.
+      #
+      # Steps performed:
+      #   1. Derive NODE_ID from the pod ordinal (last token after "-" in POD_NAME).
+      #   2. Copy the ConfigMap template to /tmp/server.properties and substitute
+      #      the __NODE_ID__ and __POD_NAME__ placeholders using sed.
+      #      NOTE: envsubst is NOT used because it requires gettext-base, which
+      #      is not installed in the apache/kafka image. sed is always available.
+      #   3. Format the KRaft metadata log with a fixed cluster-id.
+      #      --ignore-formatted is idempotent: safe to call on pod restarts.
+      # -----------------------------------------------------------------------
+      initContainers:
+        - name: kafka-init
+          image: apache/kafka:3.7.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -exc
+            - |
+              # Extract the pod ordinal from the end of the pod name.
+              # StatefulSet pods are always named <statefulset>-<ordinal>.
+              NODE_ID="${POD_NAME##*-}"
+
+              # Render the template: substitute __NODE_ID__ and __POD_NAME__
+              # placeholders using sed (guaranteed available in the base image).
+              sed \
+                -e "s|__NODE_ID__|${NODE_ID}|g" \
+                -e "s|__POD_NAME__|${POD_NAME}|g" \
+                /opt/kafka/config/kraft/server.properties \
+                > /tmp/server.properties
+
+              echo "Rendered server.properties for node.id=${NODE_ID}:"
+              grep -E "^(node\.id|advertised\.listeners|process\.roles)" /tmp/server.properties
+
+              # Format the KRaft storage directory.
+              # The cluster-id must be identical across all brokers and must
+              # never change after the first format; regenerating it would
+              # require wiping all broker data.
+              # --ignore-formatted makes this safe to call on pod restarts.
+              /opt/kafka/bin/kafka-storage.sh format \
+                --cluster-id MkU3OEVBNTcwNTJENDM2Qk \
+                --config /tmp/server.properties \
+                --ignore-formatted
+
+              echo "KRaft storage format complete for node.id=${NODE_ID}"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            # The emptyDir at /tmp is shared with the main container so the
+            # rendered server.properties persists for the main process.
+            - name: tmp-config
+              mountPath: /tmp
+            # ConfigMap template (read-only).
+            - name: kafka-config
+              mountPath: /opt/kafka/config/kraft
+              readOnly: true
+            # Kafka data directory — needed by kafka-storage.sh format.
+            - name: data
+              mountPath: /var/lib/kafka/data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+      # -----------------------------------------------------------------------
+      # Main broker container
+      # -----------------------------------------------------------------------
+      containers:
+        - name: kafka
+          image: apache/kafka:3.7.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/kafka/bin/kafka-server-start.sh
+            - /tmp/server.properties
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Pod IP injected so JMX RMI stub advertises the reachable pod address
+            # instead of 127.0.0.1 (which is unreachable from the JMX exporter pod).
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # JVM heap: 1 GiB initial / 2 GiB max. Set initial == max to avoid
+            # heap resize pauses. Adjust upward for high-throughput workloads.
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xms1g -Xmx2g"
+            # G1GC with a 20 ms pause target is well-suited for Kafka's
+            # allocation patterns. DisableExplicitGC prevents System.gc() calls
+            # (e.g. from JMX) from causing full GC pauses.
+            - name: KAFKA_JVM_PERFORMANCE_OPTS
+              value: "-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:+DisableExplicitGC"
+            # JMX on port 9999 (no auth) — suitable for in-cluster scraping.
+            # In production, enable authentication or restrict via NetworkPolicy.
+            - name: KAFKA_JMX_OPTS
+              value: >-
+                -Dcom.sun.management.jmxremote
+                -Dcom.sun.management.jmxremote.authenticate=false
+                -Dcom.sun.management.jmxremote.ssl=false
+                -Dcom.sun.management.jmxremote.port=9999
+                -Dcom.sun.management.jmxremote.rmi.port=9999
+                -Djava.rmi.server.hostname=$(POD_IP)
+          ports:
+            - name: broker
+              containerPort: 9092
+              protocol: TCP
+            - name: controller
+              containerPort: 9093
+              protocol: TCP
+            - name: jmx
+              containerPort: 9999
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+          # ----------------------------------------------------------------
+          # Readiness probe: the pod is considered ready only when port 9092
+          # accepts TCP connections, meaning the broker is fully initialized
+          # and available for client connections.
+          # initialDelaySeconds=30 gives Kafka time to complete leader
+          # election and log recovery before the first probe fires.
+          # ----------------------------------------------------------------
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+            successThreshold: 1
+          # ----------------------------------------------------------------
+          # Liveness probe: restart the container if port 9092 stops
+          # accepting connections for an extended period (60 s initial delay
+          # + 3 consecutive failures × 20 s = up to 120 s before restart).
+          # ----------------------------------------------------------------
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 3
+            successThreshold: 1
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+            # Rendered server.properties written by the init container.
+            - name: tmp-config
+              mountPath: /tmp
+            # ConfigMap template also available to the main container for
+            # reference (though the actual config used is /tmp/server.properties).
+            - name: kafka-config
+              mountPath: /opt/kafka/config/kraft
+              readOnly: true
+
+      volumes:
+        # Shared writable volume for the rendered server.properties.
+        # emptyDir is per-pod and is recreated on pod restart, which is correct
+        # because the init container must re-render the config each time.
+        - name: tmp-config
+          emptyDir: {}
+        # ConfigMap as a read-only volume — the template source.
+        - name: kafka-config
+          configMap:
+            name: kafka-config
+
+  # -------------------------------------------------------------------------
+  # VolumeClaimTemplates: one PVC per pod, named "data-kafka-<ordinal>".
+  # The StatefulSet controller creates these PVCs and they persist across
+  # pod deletions (they are NOT deleted when the StatefulSet is deleted).
+  #
+  # storageClassName is intentionally omitted so the cluster's default
+  # StorageClass is used. Set explicitly (e.g. "fast-ssd") for production to
+  # ensure low-latency local NVMe storage is provisioned.
+  # -------------------------------------------------------------------------
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: kafka
+          component: broker
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi

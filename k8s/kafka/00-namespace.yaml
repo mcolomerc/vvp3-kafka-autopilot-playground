@@ -1,0 +1,12 @@
+---
+# Dedicated namespace for all Kafka resources.
+# Isolating Kafka in its own namespace simplifies RBAC, NetworkPolicy scoping,
+# and resource quota management independently of the Flink workloads.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: messaging
+    app.kubernetes.io/part-of: vvp3-autopilot-showcase

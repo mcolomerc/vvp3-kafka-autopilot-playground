@@ -1,0 +1,162 @@
+---
+# One-shot Job to create the required Kafka topics after the cluster is ready.
+#
+# Why a Job instead of an operator/CRD:
+#   - No dependency on Strimzi or any other operator.
+#   - The Job is idempotent: --if-not-exists makes repeated runs safe.
+#   - backoffLimit: 10 covers transient failures during cluster startup.
+#
+# Topic specifications:
+#   orders        — 12 partitions, RF=3. High-throughput order event stream.
+#                   12 partitions allows up to 12 parallel Flink subtasks
+#                   (one subtask per partition) without repartitioning.
+#   order-metrics — 6 partitions, RF=3. Aggregated metrics topic; lower
+#                   parallelism is sufficient for aggregated output.
+#
+# Both topics use replication-factor=3 (all brokers) for full durability.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-create-topics
+  namespace: kafka
+  labels:
+    app: kafka
+    component: topic-init
+    app.kubernetes.io/name: kafka-create-topics
+    app.kubernetes.io/component: topic-init
+    app.kubernetes.io/part-of: vvp3-autopilot-showcase
+spec:
+  # Allow up to 10 retries to handle slow broker startup or transient errors.
+  backoffLimit: 10
+  # Clean up the Job (and its pod) 600 s after it completes, to avoid
+  # accumulating finished Jobs in the namespace over time.
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: kafka
+        component: topic-init
+    spec:
+      restartPolicy: OnFailure
+
+      # -----------------------------------------------------------------------
+      # Init container: wait for the cluster to be fully operational.
+      #
+      # Strategy: attempt to list topics via kafka-topics.sh --list.
+      # This call succeeds only when at least one broker is reachable and the
+      # controller has completed its metadata initialization.
+      # We poll all 3 brokers individually to confirm the full quorum is up
+      # before proceeding with topic creation, ensuring that RF=3 topics can
+      # actually be created with all replicas placed.
+      # -----------------------------------------------------------------------
+      initContainers:
+        - name: wait-for-kafka
+          image: apache/kafka:3.7.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              BOOTSTRAP="kafka:9092"
+              MAX_ATTEMPTS=60
+              SLEEP_SECONDS=5
+
+              echo "Waiting for Kafka cluster to be ready at ${BOOTSTRAP} ..."
+
+              attempt=0
+              until /opt/kafka/bin/kafka-topics.sh \
+                  --list \
+                  --bootstrap-server "${BOOTSTRAP}" \
+                  --command-config /dev/null \
+                  2>/dev/null; do
+                attempt=$((attempt + 1))
+                if [ "${attempt}" -ge "${MAX_ATTEMPTS}" ]; then
+                  echo "ERROR: Kafka not ready after $((MAX_ATTEMPTS * SLEEP_SECONDS)) seconds. Aborting."
+                  exit 1
+                fi
+                echo "  Attempt ${attempt}/${MAX_ATTEMPTS}: Kafka not yet ready, retrying in ${SLEEP_SECONDS}s ..."
+                sleep "${SLEEP_SECONDS}"
+              done
+
+              # Additional check: confirm all 3 brokers are visible in metadata.
+              echo "Kafka responded. Verifying all 3 brokers are registered ..."
+              attempt=0
+              until [ "$(/opt/kafka/bin/kafka-broker-api-versions.sh \
+                  --bootstrap-server "${BOOTSTRAP}" 2>/dev/null \
+                  | grep -c "id:")" -ge 3 ]; do
+                attempt=$((attempt + 1))
+                if [ "${attempt}" -ge "${MAX_ATTEMPTS}" ]; then
+                  echo "WARNING: Could not confirm all 3 brokers are up. Proceeding anyway."
+                  break
+                fi
+                echo "  Waiting for all 3 brokers ... attempt ${attempt}/${MAX_ATTEMPTS}"
+                sleep "${SLEEP_SECONDS}"
+              done
+
+              echo "Kafka cluster is ready. Proceeding with topic creation."
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+      # -----------------------------------------------------------------------
+      # Main container: create topics sequentially.
+      # --if-not-exists makes each command idempotent so the Job is safe to
+      # re-run (e.g. after a failed partial execution).
+      # -----------------------------------------------------------------------
+      containers:
+        - name: create-topics
+          image: apache/kafka:3.7.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -exc
+            - |
+              BOOTSTRAP="kafka:9092"
+
+              echo "Creating topic: orders"
+              /opt/kafka/bin/kafka-topics.sh \
+                --create \
+                --bootstrap-server "${BOOTSTRAP}" \
+                --topic orders \
+                --partitions 12 \
+                --replication-factor 3 \
+                --if-not-exists
+
+              echo "Creating topic: order-metrics"
+              /opt/kafka/bin/kafka-topics.sh \
+                --create \
+                --bootstrap-server "${BOOTSTRAP}" \
+                --topic order-metrics \
+                --partitions 6 \
+                --replication-factor 3 \
+                --if-not-exists
+
+              echo ""
+              echo "Topic creation complete. Current topic list:"
+              /opt/kafka/bin/kafka-topics.sh \
+                --list \
+                --bootstrap-server "${BOOTSTRAP}"
+
+              echo ""
+              echo "Topic details:"
+              /opt/kafka/bin/kafka-topics.sh \
+                --describe \
+                --bootstrap-server "${BOOTSTRAP}" \
+                --topic orders
+
+              /opt/kafka/bin/kafka-topics.sh \
+                --describe \
+                --bootstrap-server "${BOOTSTRAP}" \
+                --topic order-metrics
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

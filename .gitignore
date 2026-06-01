@@ -1,0 +1,28 @@
+# Build outputs
+**/target/
+**/build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Compiled class files
+*.class
+
+# Logs
+*.log
+
+# Temporary / local scenario results
+results.csv
+/tmp/
+
+# Sensitive config — never commit
+**/.env
+**/*.env
+**/secrets.yaml
+**/credentials.json

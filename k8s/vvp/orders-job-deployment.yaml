@@ -1,0 +1,123 @@
+# VVP3 Flink Deployment — Orders Job
+#
+# Apply via vvctl:
+#   vvctl create deployment -f k8s/vvp/orders-job-deployment.yaml
+#
+# Or via REST API:
+#   curl -X POST http://localhost:8080/api/v1/namespaces/default/deployments \
+#     -H "Authorization: Bearer <token>" \
+#     -H "Content-Type: application/yaml" \
+#     --data-binary @k8s/vvp/orders-job-deployment.yaml
+#
+# Then start:
+#   vvctl start deployment orders-job
+#
+# Notes:
+#   - Artifact must be uploaded before deploying:
+#     vvctl create artifact flink-job/target/flink-job-1.0.0-SNAPSHOT.jar
+#   - flinkConfiguration includes the VVP3 3.1 metrics bug workaround (see below).
+
+apiVersion: v1
+kind: Deployment
+metadata:
+  name: orders-job
+  namespace: default
+  annotations:
+    description: "VVP3 Autopilot showcase — Orders windowed aggregation job"
+
+spec:
+  state: CANCELLED
+  deploymentTargetName: vvp-deploy
+  engineVersion: vera-4.5-jdk11-flink-1.20
+  executionMode: STREAMING
+
+  # -------------------------------------------------------------------------
+  # Artifact
+  # -------------------------------------------------------------------------
+  template:
+    spec:
+      artifact:
+        kind: JAR
+        jarUri: "s3i://vvp/artifacts/namespaces/default/flink-job-1.0.0-SNAPSHOT.jar"
+        entryClass: com.ververica.showcase.OrdersJob
+
+      # -----------------------------------------------------------------------
+      # Parallelism — Autopilot will scale from this baseline
+      # -----------------------------------------------------------------------
+      parallelism: 1
+
+      # -----------------------------------------------------------------------
+      # Resources
+      # -----------------------------------------------------------------------
+      resources:
+        jobmanager:
+          cpu: 1
+          memory: "1Gi"
+        taskmanager:
+          cpu: 1
+          memory: "2Gi"
+
+      # -----------------------------------------------------------------------
+      # Flink configuration
+      #
+      # VVP3 3.1 metrics bug workaround (Portal ticket 45275608473):
+      #   VVP3 3.1 injects metrics reporters using the deprecated
+      #   metrics.reporter.<name>.class syntax. Flink 1.20 silently skips
+      #   reporters configured this way, so nothing listens on port 9999.
+      #   Adding factory.class overrides makes Flink use the correct factory
+      #   and start the reporters. A harmless "Duplicate class configuration"
+      #   warning is logged — the reporter starts correctly.
+      #   Remove these two lines once VVP3 ships the fix.
+      # -----------------------------------------------------------------------
+      flinkConfiguration:
+        # --- VVP3 3.1 metrics bug workaround (remove when VVP3 is fixed) ---
+        metrics.reporter.promappmgr.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.jmx.factory.class:        org.apache.flink.metrics.jmx.JMXReporterFactory
+
+        # --- Checkpointing ---
+        # Interval aligned with the job's 30 s tumbling windows; checkpoints
+        # fire every 60 s so state is always at most one window behind.
+        # Note: execution.checkpointing.timeout and .mode are job-level settings
+        # managed by the Flink runtime; VVP3 does not store them in flinkConf.
+        execution.checkpointing.interval: "60s"
+        execution.checkpointing.min-pause: "30s"
+
+        # --- Restart strategy ---
+        # Fixed-delay with 3 attempts covers transient Kafka broker hiccups.
+        # Unlimited retries (2147483647) would interfere with Autopilot
+        # scale decisions, so we cap at 3.
+        restart-strategy:                      fixed-delay
+        restart-strategy.fixed-delay.attempts: "3"
+        restart-strategy.fixed-delay.delay:    "10 s"
+
+        # --- VVP3 default ---
+        # VVP3 injects table.exec.state.ttl for SQL/Table API jobs.
+        # Included here to document the full effective flinkConf.
+        table.exec.state.ttl: "36 h"
+
+      # -----------------------------------------------------------------------
+      # Environment variables
+      # -----------------------------------------------------------------------
+      envs:
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          value: "kafka.kafka.svc.cluster.local:9092"
+        # FLINK_PARALLELISM removed — parallelism is now controlled entirely
+        # by the VVP3 deployment parallelism setting (→ parallelism.default),
+        # which allows Autopilot to scale the job dynamically.
+
+  # -------------------------------------------------------------------------
+  # Autopilot
+  #
+  # Two independent Autopilot features:
+  #   mode: active   — Autopilot manages parallelism (scale in/out decisions).
+  #                    Use "monitor" to see recommendations without applying them.
+  #   resourceTuning: autopilot — Adaptive strategy: Autopilot also tunes
+  #                    per-TaskManager CPU and memory based on observed usage.
+  #                    Set via UI: Deployment → Edit → Autopilot → Adaptive.
+  # -------------------------------------------------------------------------
+  autopilot:
+    mode: active
+
+  resourceTuning:
+    mode: autopilot
+ 

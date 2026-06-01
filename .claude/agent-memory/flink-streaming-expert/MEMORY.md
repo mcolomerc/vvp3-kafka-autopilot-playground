@@ -1,0 +1,1 @@
+- [VVP3 Autopilot Showcase project](project_vvp3_showcase.md) — Flink 1.20 / Java 11 showcase job; versions, operator UIDs, env vars, design decisions for Stage 3

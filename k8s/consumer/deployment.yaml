@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-consumer
+  namespace: kafka
+  labels:
+    app: kafka-consumer
+    component: consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-consumer
+  template:
+    metadata:
+      labels:
+        app: kafka-consumer
+        component: consumer
+    spec:
+      containers:
+        - name: kafka-consumer
+          # imagePullPolicy: Never — for local Kind/Minikube testing with a locally built image.
+          # Change to IfNotPresent or Always (with a registry-prefixed image name) for production.
+          image: kafka-consumer:latest
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: kafka-consumer-config
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          # No readiness probe — this is a background consumer, not a request-serving pod.
+          # The pod is considered ready as soon as the container starts.
+          # Graceful termination: allow the consumer to finish its current poll cycle
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 3"]
+      terminationGracePeriodSeconds: 15

@@ -1,0 +1,217 @@
+# Kafka JMX Exporter — translates Kafka JMX metrics into Prometheus format.
+#
+# Components deployed in this file (all in namespace `kafka` unless noted):
+#   1. ConfigMap  kafka-jmx-config      — JMX exporter rules configuration
+#   2. Deployment kafka-jmx-exporter    — runs bitnami/jmx-exporter
+#   3. Service    kafka-jmx-exporter    — ClusterIP on port 5556
+#   4. ServiceMonitor kafka-jmx         — in namespace `monitoring` so the
+#                                         Prometheus Operator picks it up
+#
+# The exporter scrapes Kafka broker 0 via JMX (port 9999).
+# For a 3-node cluster you would typically run one exporter per broker;
+# for this showcase a single exporter on broker-0 is sufficient to observe
+# throughput and consumer-lag trends.
+
+---
+# ---------------------------------------------------------------------------
+# 1. ConfigMap — JMX exporter rules
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-jmx-config
+  namespace: kafka
+  labels:
+    app: kafka-jmx-exporter
+data:
+  config.yaml: |
+    hostPort: kafka-0.kafka-headless.kafka.svc.cluster.local:9999
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+
+    # jmx_prometheus_standalone 1.x uses "allowlist" (renamed from "whitelistObjectNames")
+    allowlist:
+      - "kafka.server:type=BrokerTopicMetrics,*"
+      - "kafka.server:type=FetcherLagMetrics,*"
+      - "kafka.server:type=ReplicaManager,*"
+      - "kafka.controller:type=KafkaController,*"
+      - "kafka.network:type=RequestMetrics,*"
+
+    rules:
+      # Use .* to match properties in any order — JMX ObjectName canonical
+      # form may sort properties alphabetically.
+
+      # Topic message ingest rate — "Orders Inbound Rate" panel
+      - pattern: 'kafka.server<.*name=MessagesInPerSec.*topic=([^,>]+).*><>OneMinuteRate'
+        name: kafka_server_brokertopicmetrics_messagesin_oneminuterate
+        labels:
+          topic: "$1"
+
+      # Topic bytes ingest rate — "Kafka Bytes In Rate" panel
+      - pattern: 'kafka.server<.*name=BytesInPerSec.*topic=([^,>]+).*><>OneMinuteRate'
+        name: kafka_server_brokertopicmetrics_bytesin_oneminuterate
+        labels:
+          topic: "$1"
+
+      # Consumer lag per partition — "Flink Consumer Lag" panel
+      # Bean registration order: type, name, clientId, topic, partition (with spaces after commas).
+      # Pattern captures topic and partition in that order.
+      - pattern: 'kafka.server<.*name=ConsumerLag.*topic=([^,>]+).*partition=([0-9]+).*><>Value'
+        name: kafka_server_fetcherlagmetrics_consumerlag
+        labels:
+          topic: "$1"
+          partition: "$2"
+
+      # Under-replicated partitions
+      - pattern: 'kafka.server<.*name=UnderReplicatedPartitions.*><>Value'
+        name: kafka_server_replicamanager_underreplicatedpartitions
+
+      # Active controller count
+      - pattern: 'kafka.controller<.*name=ActiveControllerCount.*><>Value'
+        name: kafka_controller_kafkacontroller_activecontrollercount
+
+      # Request latency mean
+      - pattern: 'kafka.network<.*name=TotalTimeMs.*request=([^,>]+).*><>Mean'
+        name: kafka_network_requestmetrics_totaltimems_mean
+        labels:
+          request: "$1"
+
+---
+# ---------------------------------------------------------------------------
+# 2. Deployment — JMX Exporter
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-jmx-exporter
+  namespace: kafka
+  labels:
+    app: kafka-jmx-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-jmx-exporter
+  template:
+    metadata:
+      labels:
+        app: kafka-jmx-exporter
+      annotations:
+        # Prometheus scrape annotations as a fallback if ServiceMonitor is
+        # not yet picked up by the operator.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5556"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Prefer scheduling on a different node than the Kafka pods to avoid
+      # JMX scraping adding CPU noise on the same node.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: kafka
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: jmx-exporter
+          image: bitnami/jmx-exporter:latest
+          # The jmx-exporter JAR is invoked as:
+          #   java -jar jmx_prometheus_httpserver.jar <port> <config-file>
+          args:
+            - "5556"
+            - /etc/jmx/config.yaml
+          ports:
+            - name: metrics
+              containerPort: 5556
+              protocol: TCP
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+          volumeMounts:
+            - name: jmx-config
+              mountPath: /etc/jmx
+              readOnly: true
+
+          # Lightweight readiness probe — the HTTP server is ready once it
+          # can serve the /metrics endpoint.
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            timeoutSeconds: 30
+            failureThreshold: 5
+
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 120
+            periodSeconds: 60
+            timeoutSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: jmx-config
+          configMap:
+            name: kafka-jmx-config
+
+---
+# ---------------------------------------------------------------------------
+# 3. Service — ClusterIP exposing port 5556
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-jmx-exporter
+  namespace: kafka
+  labels:
+    app: kafka-jmx-exporter
+spec:
+  type: ClusterIP
+  selector:
+    app: kafka-jmx-exporter
+  ports:
+    - name: metrics
+      port: 5556
+      targetPort: metrics
+      protocol: TCP
+
+---
+# ---------------------------------------------------------------------------
+# 4. ServiceMonitor — in namespace `monitoring` so the Prometheus Operator
+#    finds it without extra namespace selectors.
+#    Requires kube-prometheus-stack with prometheusOperator.enabled=true.
+# ---------------------------------------------------------------------------
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kafka-jmx
+  namespace: monitoring
+  labels:
+    # This label is required by the default kube-prometheus-stack Prometheus
+    # selector so the monitor is automatically added to the Prometheus config.
+    release: monitoring
+spec:
+  # Discover the Service in the `kafka` namespace.
+  namespaceSelector:
+    matchNames:
+      - kafka
+  selector:
+    matchLabels:
+      app: kafka-jmx-exporter
+  endpoints:
+    - port: metrics
+      interval: 5s
+      scrapeTimeout: 4s
+      path: /metrics

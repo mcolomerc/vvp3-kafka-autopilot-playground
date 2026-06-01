@@ -1,0 +1,201 @@
+# kube-prometheus-stack Helm values for VVP3 Autopilot Showcase
+# Chart: prometheus-community/kube-prometheus-stack
+# Deploy with:
+#   helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace \
+#     -f k8s/monitoring/kube-prometheus-stack-values.yaml
+
+# ---------------------------------------------------------------------------
+# Prometheus configuration
+# ---------------------------------------------------------------------------
+prometheus:
+  prometheusSpec:
+    # 5-second scrape/eval intervals match Flink metric emission cadence and
+    # allow the dashboard auto-refresh to show near-real-time scaling events.
+    scrapeInterval: 5s
+    evaluationInterval: 5s
+
+    # Retain 7 days of data — sufficient for post-demo analysis.
+    retention: 7d
+
+    # Persistent storage so metrics survive pod restarts.
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          # Uses the cluster's default StorageClass (works on GKE, EKS, AKS, k3s …)
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 20Gi
+
+    # Allow Prometheus to discover ServiceMonitors & PodMonitors in ALL namespaces,
+    # not only the one where the operator lives. Required for kafka + vvp namespaces.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+    # ---------------------------------------------------------------------------
+    # Additional scrape configs (jobs not covered by a ServiceMonitor CRD)
+    # ---------------------------------------------------------------------------
+    additionalScrapeConfigs:
+
+      # --- Flink TaskManagers ---------------------------------------------------
+      # VVP3 deploys TaskManagers in the `vvp-deploy` namespace.
+      # VVP3 injects its own Prometheus reporter (promappmgr) on port 9999.
+      - job_name: flink-taskmanagers
+        scrape_interval: 5s
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - vvp-deploy
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_component]
+            action: keep
+            regex: taskmanager
+          - source_labels: [__address__]
+            action: replace
+            regex: "([^:]+)(?::\\d+)?"
+            replacement: "${1}:9999"
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_label_deploymentName]
+            target_label: flink_job
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+      # --- Kafka JMX Exporter --------------------------------------------------
+      # The jmx-exporter sidecar/deployment translates Kafka JMX metrics into
+      # Prometheus format. It runs in the `kafka` namespace at port 5556.
+      - job_name: kafka-jmx
+        scrape_interval: 30s
+        scrape_timeout: 25s
+        static_configs:
+          - targets:
+              - kafka-jmx-exporter.kafka.svc.cluster.local:5556
+            labels:
+              cluster: kafka
+
+      # --- Flink JobManagers ---------------------------------------------------
+      # Scrapes checkpoint and job-level metrics from JM pods (component=jobmanager).
+      # These include lastCheckpointDuration, lastCheckpointSize, totalNumberOfCheckpoints.
+      - job_name: flink-jobmanagers
+        scrape_interval: 5s
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - vvp-deploy
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_component]
+            action: keep
+            regex: jobmanager
+          - source_labels: [__address__]
+            action: replace
+            regex: "([^:]+)(?::\\d+)?"
+            replacement: "${1}:9999"
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_label_deploymentName]
+            target_label: flink_job
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+      # --- Kafka Producer (Spring Boot Actuator) -------------------------------
+      # Scrapes /actuator/prometheus on the producer pod for:
+      #   - Application gauges: producer.throughput.*, producer.peak.active,
+      #     producer.messages.produced, producer.messages.errors
+      #   - Kafka client metrics: kafka.producer.record.send.rate,
+      #     kafka.producer.record.error.rate, kafka.producer.request.latency.avg,
+      #     kafka.producer.batch.size.avg, kafka.producer.buffer.available.bytes
+      - job_name: kafka-producer
+        scrape_interval: 5s
+        metrics_path: /actuator/prometheus
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - kafka
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: kafka-producer
+          - source_labels: [__address__]
+            action: replace
+            regex: "([^:]+)(?::\\d+)?"
+            replacement: "${1}:8888"
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+# ---------------------------------------------------------------------------
+# Grafana configuration
+# ---------------------------------------------------------------------------
+grafana:
+  adminPassword: autopilot-showcase
+
+  # Persist dashboards and settings across pod restarts.
+  persistence:
+    enabled: true
+    size: 5Gi
+
+  # Expose Grafana on a NodePort so it is reachable from a laptop browser
+  # without running `kubectl port-forward` during a live demo.
+  service:
+    type: ClusterIP
+
+  # ---------------------------------------------------------------------------
+  # Dashboard providers — tells Grafana where to look for JSON dashboard files.
+  # ---------------------------------------------------------------------------
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: autopilot
+          orgId: 1
+          folder: VVP3 Autopilot
+          type: file
+          disableDeletion: false
+          updateIntervalSeconds: 10
+          allowUiUpdates: false
+          options:
+            # This path must match the mountPath used in dashboardsConfigMaps below.
+            path: /var/lib/grafana/dashboards/autopilot
+
+  # ---------------------------------------------------------------------------
+  # Mount the dashboard ConfigMap into the path declared above.
+  # The key in dashboardsConfigMaps must match the provider name ("autopilot").
+  # ---------------------------------------------------------------------------
+  dashboardsConfigMaps:
+    autopilot: grafana-autopilot-dashboard
+
+  # We mount dashboards explicitly via ConfigMap, so the sidecar auto-discovery
+  # feature is not needed (and saves a container slot in the Grafana pod).
+  sidecar:
+    dashboards:
+      enabled: false
+
+# ---------------------------------------------------------------------------
+# Alertmanager — not needed for this demo showcase.
+# ---------------------------------------------------------------------------
+alertmanager:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# Kubernetes infrastructure exporters
+# ---------------------------------------------------------------------------
+kubeStateMetrics:
+  # Required for kube_pod_status_phase, kube_pod_status_ready_time, etc.
+  # used in the Autopilot Insights dashboard row.
+  enabled: true
+
+nodeExporter:
+  # Node-level CPU/memory metrics provide context for TM resource utilisation.
+  enabled: true
+
+prometheusOperator:
+  # Manages Prometheus/Alertmanager CRDs and reconciles ServiceMonitor objects
+  # (e.g. the kafka-jmx ServiceMonitor we deploy separately).
+  enabled: true

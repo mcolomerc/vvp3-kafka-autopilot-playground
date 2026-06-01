@@ -1,0 +1,110 @@
+---
+# ConfigMap holding the KRaft server.properties template.
+# Values that differ per pod (node.id, advertised.listeners) are written
+# by the init container at startup time; all other settings are static.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-config
+  namespace: kafka
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: broker-config
+    app.kubernetes.io/part-of: vvp3-autopilot-showcase
+data:
+  server.properties: |
+    # -------------------------------------------------------------------------
+    # KRaft mode — no ZooKeeper dependency.
+    # This broker also acts as a controller (combined mode), which is appropriate
+    # for a 3-node cluster where we want a full quorum without dedicated controller
+    # nodes. For larger clusters (10+ brokers) prefer dedicated controller nodes.
+    # -------------------------------------------------------------------------
+    process.roles=broker,controller
+
+    # node.id is injected by the init container using the pod ordinal (0, 1, 2).
+    # The __NODE_ID__ placeholder is replaced via sed inside the init container.
+    # Using a sentinel token (not a shell variable) avoids accidental expansion
+    # if the ConfigMap value is ever evaluated in a shell context.
+    node.id=__NODE_ID__
+
+    # All three nodes participate in the controller quorum.
+    # Using the headless service FQDN ensures stable DNS names across pod restarts.
+    controller.quorum.voters=0@kafka-0.kafka-headless.kafka.svc.cluster.local:9093,1@kafka-1.kafka-headless.kafka.svc.cluster.local:9093,2@kafka-2.kafka-headless.kafka.svc.cluster.local:9093
+
+    # -------------------------------------------------------------------------
+    # Listeners
+    # PLAINTEXT on 9092 — inter-broker and client traffic.
+    # CONTROLLER on 9093 — Raft metadata replication; never exposed externally.
+    # -------------------------------------------------------------------------
+    listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+
+    # advertised.listeners is set per-pod by the init container so that clients
+    # always resolve to the correct headless DNS entry for a specific broker.
+    # __POD_NAME__ is replaced via sed in the init container.
+    advertised.listeners=PLAINTEXT://__POD_NAME__.kafka-headless.kafka.svc.cluster.local:9092
+
+    inter.broker.listener.name=PLAINTEXT
+    controller.listener.names=CONTROLLER
+
+    # Security protocol map — PLAINTEXT for both data-plane listeners.
+    # In production, replace PLAINTEXT with SSL or SASL_SSL.
+    listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+
+    # -------------------------------------------------------------------------
+    # Storage
+    # -------------------------------------------------------------------------
+    # Single log directory mounted from the PVC. For higher throughput
+    # consider JBOD (multiple log.dirs entries across separate volumes).
+    # Use a subdirectory so the PVC's lost+found (created by ext4 mkfs) is
+    # never seen by Kafka's LogManager, which rejects any non-topic directory.
+    log.dirs=/var/lib/kafka/data/kafka-logs
+
+    # -------------------------------------------------------------------------
+    # Topic defaults
+    # auto.create.topics.enable=false enforces intentional topic creation
+    # (handled by the 05-topics-job.yaml Job), preventing accidental topics
+    # from mis-typed producer/consumer configurations.
+    # -------------------------------------------------------------------------
+    num.partitions=1
+    default.replication.factor=3
+    min.insync.replicas=2
+    auto.create.topics.enable=false
+
+    # Internal topics — replicated across all 3 brokers for durability.
+    offsets.topic.replication.factor=3
+    transaction.state.log.replication.factor=3
+    transaction.state.log.min.isr=2
+
+    # -------------------------------------------------------------------------
+    # Log retention
+    # -------------------------------------------------------------------------
+    # 1-hour time-based retention for demo; prevents disk fill during peak tests.
+    # Increase to 168 (7 days) for production scenarios.
+    log.retention.hours=1
+    log.segment.bytes=134217728
+    # Size-based cap: 2 GiB per partition across all topics.
+    # With 10 Gi PVCs and ~30 partitions total, this keeps usage well under 10 Gi.
+    log.retention.bytes=2147483648
+
+    # -------------------------------------------------------------------------
+    # KRaft startup timeouts
+    # The default initial.broker.registration.timeout.ms=60000 is too short
+    # for cold-start on EKS where all 3 pods start simultaneously and storage
+    # provisioning / JVM startup may take >30 s on some nodes.
+    # 300 s gives plenty of headroom for quorum to form on first boot.
+    # -------------------------------------------------------------------------
+    initial.broker.registration.timeout.ms=300000
+    # How long the Raft leader waits before calling a new election if it
+    # hears nothing from a follower. Increase slightly to tolerate slow starts.
+    controller.quorum.election.timeout.ms=5000
+    controller.quorum.fetch.timeout.ms=10000
+
+    # -------------------------------------------------------------------------
+    # Network & I/O threads (tuned for a moderate workload baseline)
+    # -------------------------------------------------------------------------
+    # Scale num.network.threads and num.io.threads up on high-throughput nodes.
+    num.network.threads=3
+    num.io.threads=8
+    socket.send.buffer.bytes=102400
+    socket.receive.buffer.bytes=102400
+    socket.request.max.bytes=104857600

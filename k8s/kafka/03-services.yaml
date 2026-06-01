@@ -1,0 +1,74 @@
+---
+# Headless Service for the Kafka StatefulSet.
+#
+# clusterIP: None — Kubernetes does not allocate a virtual IP. DNS queries for
+# "kafka-headless.kafka.svc.cluster.local" return the pod IPs directly (A records),
+# and individual broker FQDNs resolve as:
+#   kafka-0.kafka-headless.kafka.svc.cluster.local
+#   kafka-1.kafka-headless.kafka.svc.cluster.local
+#   kafka-2.kafka-headless.kafka.svc.cluster.local
+#
+# These stable DNS names are used in:
+#   - controller.quorum.voters (ConfigMap)
+#   - advertised.listeners (rendered by init container)
+#
+# publishNotReadyAddresses: true — include pod DNS entries even before the pod
+# passes its readiness probe. This is required so that controller quorum
+# members can reach each other during initial cluster formation, when none of
+# the brokers are "ready" yet (they are bootstrapping the metadata log).
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+  namespace: kafka
+  labels:
+    app: kafka
+    component: broker
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: headless-service
+    app.kubernetes.io/part-of: vvp3-autopilot-showcase
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: kafka
+  ports:
+    - name: broker
+      port: 9092
+      targetPort: 9092
+      protocol: TCP
+    - name: controller
+      port: 9093
+      targetPort: 9093
+      protocol: TCP
+
+---
+# ClusterIP Service — stable virtual IP for client bootstrap.
+#
+# Application pods in other namespaces (e.g., Flink jobs in namespace "flink")
+# use this as their bootstrap server: kafka.kafka.svc.cluster.local:9092
+# Pods within the kafka namespace can use the short form: kafka:9092
+#
+# Kubernetes load-balances connections across all ready broker pods.
+# After the initial bootstrap, the Kafka client discovers all broker addresses
+# from the cluster metadata and establishes direct connections, so this service
+# is only used for the first connection (bootstrap phase).
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: kafka
+  labels:
+    app: kafka
+    component: broker
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: service
+    app.kubernetes.io/part-of: vvp3-autopilot-showcase
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: broker
+      port: 9092
+      targetPort: 9092
+      protocol: TCP
